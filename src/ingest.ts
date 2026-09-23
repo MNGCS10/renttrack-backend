@@ -55,7 +55,6 @@ app.post("/api/device/ping", async (c) => {
     return c.json({ error: "missing device_id/lat/lng" }, 400);
   }
 
-  // 1. โหลด device + tenant + vehicle + active rental (ถ้ามี)
   const { data: device, error: deviceErr } = await supabase
     .from("devices")
     .select("id, tenant_id, vehicle_id, status, tenants!inner(status)")
@@ -66,8 +65,6 @@ app.post("/api/device/ping", async (c) => {
     return c.json({ error: "unknown device" }, 404);
   }
 
-  // 1b. ปฏิเสธ ping ถ้า tenant ถูกระงับ (ไม่จ่ายค่าบริการ) — ไม่ต้องแตะ infra เลย
-  // แค่เปลี่ยน tenants.status = 'suspended' ใน DB มือถือของลูกค้ารายนั้นก็หยุดอัปเดตทันที
   const tenantStatus = (device as any).tenants?.status;
   if (tenantStatus === "suspended") {
     return c.json({ error: "tenant suspended — service paused" }, 403);
@@ -80,7 +77,6 @@ app.post("/api/device/ping", async (c) => {
     .eq("status", "active")
     .maybeSingle();
 
-  // 2. ดึงตำแหน่งล่าสุดของ device นี้ (สำหรับเช็ค movement)
   const { data: lastPos } = await supabase
     .from("positions")
     .select("lat, lng, recorded_at")
@@ -95,7 +91,6 @@ app.post("/api/device/ping", async (c) => {
     distanceMoved = haversineMeters(lastPos.lat, lastPos.lng, lat, lng);
   }
 
-  // 3. Insert position ใหม่
   await supabase.from("positions").insert({
     device_id,
     rental_id: activeRental?.id ?? null,
@@ -106,7 +101,6 @@ app.post("/api/device/ping", async (c) => {
     recorded_at: now.toISOString(),
   });
 
-  // 4. Append เข้า rental_routes ถ้ามี rental active (route jsonb pattern จาก MedMove)
   if (activeRental) {
     await supabase.rpc("append_rental_route_point", {
       p_rental_id: activeRental.id,
@@ -114,7 +108,6 @@ app.post("/api/device/ping", async (c) => {
     });
   }
 
-  // 5. Update device heartbeat
   await supabase
     .from("devices")
     .update({
@@ -124,7 +117,6 @@ app.post("/api/device/ping", async (c) => {
     })
     .eq("id", device_id);
 
-  // 6. Alert engine — เช็คทุก rule ที่ enabled สำหรับ tenant นี้
   await runAlertChecks({
     tenantId: device.tenant_id,
     vehicleId: device.vehicle_id,
@@ -138,9 +130,6 @@ app.post("/api/device/ping", async (c) => {
   return c.json({ ok: true });
 });
 
-// ---------------------------------------------------------------------
-// Alert engine
-// ---------------------------------------------------------------------
 async function runAlertChecks(params: {
   tenantId: string;
   vehicleId: string;
@@ -162,7 +151,6 @@ async function runAlertChecks(params: {
 
   const ruleMap = Object.fromEntries(rules.map((r) => [r.rule_type, r]));
 
-  // --- movement_without_rental: รถขยับ (>threshold) แต่ไม่มีสัญญาเช่า active ---
   if (ruleMap["movement_without_rental"] && !hasActiveRental && distanceMoved > MOVEMENT_THRESHOLD_M) {
     await raiseAlert({
       tenantId,
@@ -175,7 +163,6 @@ async function runAlertChecks(params: {
     });
   }
 
-  // --- geofence_exit / geofence_enter_restricted ---
   if (ruleMap["geofence_exit"] || ruleMap["geofence_enter_restricted"]) {
     const { data: zones } = await supabase
       .from("geofence_zones")
@@ -211,9 +198,6 @@ async function runAlertChecks(params: {
       }
     }
   }
-
-  // --- overdue_return: เช็คแยกเป็น cron job ต่างหาก ไม่เหมาะเช็คทุก ping ---
-  // --- device_offline: เช็คแยกเป็น cron job (scan devices.last_ping_at) ---
 }
 
 async function raiseAlert(params: {
@@ -225,7 +209,6 @@ async function raiseAlert(params: {
   lat: number;
   lng: number;
 }) {
-  // กันแจ้งซ้ำถี่เกินไป — เช็ค alert ประเภทเดียวกัน ในช่วง 5 นาทีล่าสุด ของ vehicle เดียวกัน
   const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
   const { data: recent } = await supabase
     .from("alerts")
@@ -235,7 +218,7 @@ async function raiseAlert(params: {
     .gte("created_at", fiveMinAgo)
     .limit(1);
 
-  if (recent && recent.length > 0) return; // เพิ่งแจ้งไปแล้ว ข้าม
+  if (recent && recent.length > 0) return;
 
   await supabase.from("alerts").insert({
     tenant_id: params.tenantId,
@@ -246,21 +229,6 @@ async function raiseAlert(params: {
     lat: params.lat,
     lng: params.lng,
   });
-
-  // TODO: ต่อ LINE push message ตรงนี้ (reuse webhook LINE จาก MedMove)
-  // await sendLineAlert(params.tenantId, params.message);
 }
 
 export default app;
-
-/* =====================================================================
- * SQL helper function ที่ต้อง apply ใน Supabase ก่อนใช้งาน (ทำไปแล้วตอน apply schema):
- *
- * create or replace function append_rental_route_point(p_rental_id uuid, p_point jsonb)
- * returns void language sql set search_path = public as $$
- *   insert into rental_routes (rental_id, route, updated_at)
- *   values (p_rental_id, jsonb_build_array(p_point), now())
- *   on conflict (rental_id) do update
- *   set route = rental_routes.route || p_point, updated_at = now();
- * $$;
- * ===================================================================== */
