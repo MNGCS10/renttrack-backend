@@ -5,9 +5,14 @@
 // =====================================================================
 
 import { Hono } from "hono";
+import { cors } from "hono/cors";
 import { createClient } from "@supabase/supabase-js";
 
 const app = new Hono();
+
+// เปิด CORS — PWA tracker (Cloudflare) กับ backend (Render) อยู่คนละ origin กัน
+// ไม่เปิดตรงนี้ browser จะบล็อก request ตั้งแต่ก่อนถึง server เลย (preflight fail)
+app.use("/*", cors({ origin: "*", allowMethods: ["GET", "POST"] }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL!,
