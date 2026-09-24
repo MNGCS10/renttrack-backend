@@ -8,6 +8,11 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { createClient } from "@supabase/supabase-js";
 import { generateContractPdf } from "./contract.js";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const app = new Hono();
 
@@ -408,6 +413,85 @@ async function pushLineMessage(targetId: string, text: string) {
     console.error("LINE push (renter) failed:", err);
   }
 }
+
+// ---------------------------------------------------------------------
+// ONE-TIME SETUP — สร้าง Rich Menu ผ่าน LINE API โดยตรง
+// (LINE OA Manager UI รุ่นใหม่ไม่ให้วาดกล่อง custom เองแล้ว ต้องยิง API ตรง)
+// เปิดลิงก์นี้ครั้งเดียว: /api/admin/setup-richmenu?secret=xxx
+// ---------------------------------------------------------------------
+app.get("/api/admin/setup-richmenu", async (c) => {
+  const secret = c.req.query("secret");
+  if (!secret || secret !== process.env.ADMIN_SETUP_SECRET) {
+    return c.json({ error: "unauthorized" }, 403);
+  }
+
+  const token = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+  if (!token) return c.json({ error: "LINE_CHANNEL_ACCESS_TOKEN not set" }, 500);
+
+  const richMenuObject = {
+    size: { width: 2500, height: 1686 },
+    selected: true,
+    name: "RentTrack Main Menu",
+    chatBarText: "เมนู",
+    areas: [
+      {
+        bounds: { x: 0, y: 0, width: 833, height: 1536 },
+        action: { type: "uri", uri: "https://wispy-credit-9967.mng-cs10.workers.dev/" },
+      },
+      {
+        bounds: { x: 833, y: 0, width: 834, height: 1536 },
+        action: { type: "message", text: "สวัสดีค่ะ ต้องการสอบถามเกี่ยวกับการเช่ารถ" },
+      },
+      {
+        bounds: { x: 1667, y: 0, width: 833, height: 1536 },
+        action: { type: "message", text: "ขอทราบวิธีการเช่ารถ" },
+      },
+      {
+        bounds: { x: 2320, y: 1500, width: 180, height: 186 },
+        action: { type: "uri", uri: "https://raspy-rain-0046.mng-cs10.workers.dev/" },
+      },
+    ],
+  };
+
+  try {
+    // 1. สร้าง rich menu object
+    const createRes = await fetch("https://api.line.me/v2/bot/richmenu", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify(richMenuObject),
+    });
+    const createData = await createRes.json();
+    if (!createRes.ok) return c.json({ step: "create", error: createData }, 500);
+
+    const richMenuId = createData.richMenuId;
+
+    // 2. อัปโหลดรูปภาพ (endpoint คนละ host — api-data.line.me)
+    const imageBytes = fs.readFileSync(path.join(__dirname, "../assets/richmenu.jpg"));
+    const uploadRes = await fetch(`https://api-data.line.me/v2/bot/richmenu/${richMenuId}/content`, {
+      method: "POST",
+      headers: { "Content-Type": "image/jpeg", Authorization: `Bearer ${token}` },
+      body: imageBytes,
+    });
+    if (!uploadRes.ok) {
+      const uploadErr = await uploadRes.text();
+      return c.json({ step: "upload", error: uploadErr, richMenuId }, 500);
+    }
+
+    // 3. ตั้งเป็น default rich menu ให้ทุกคนเห็น
+    const defaultRes = await fetch(`https://api.line.me/v2/bot/user/all/richmenu/${richMenuId}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!defaultRes.ok) {
+      const defaultErr = await defaultRes.text();
+      return c.json({ step: "set-default", error: defaultErr, richMenuId }, 500);
+    }
+
+    return c.json({ ok: true, richMenuId, message: "Rich menu created and set as default successfully" });
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500);
+  }
+});
 
 // ชั่วคราว — ดัก LINE userId ตอนทักแชท (เอาไปตั้ง LINE_ALERT_TARGET_ID)
 // ไปตั้ง Webhook URL นี้ใน LINE Developers Console แล้วส่งข้อความหา OA ดูใน Render log
