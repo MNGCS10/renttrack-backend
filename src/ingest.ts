@@ -7,6 +7,7 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { createClient } from "@supabase/supabase-js";
+import { generateContractPdf } from "./contract.js";
 
 const app = new Hono();
 
@@ -283,7 +284,7 @@ app.post("/api/admin/rentals/:id/approve", async (c) => {
 
   const { data: rental } = await supabase
     .from("rentals")
-    .select("id, tenant_id, vehicle_id, renter_id, price_total, renters(line_user_id, full_name)")
+    .select("id, tenant_id, vehicle_id, renter_id, price_total, start_at, planned_end_at, renters(line_user_id, full_name, phone, id_card_number, address), tenants(name)")
     .eq("id", rentalId)
     .single();
 
@@ -292,7 +293,7 @@ app.post("/api/admin/rentals/:id/approve", async (c) => {
 
   const { data: vehicle } = await supabase
     .from("vehicles")
-    .select("deposit_amount, plate_number")
+    .select("deposit_amount, plate_number, brand, model, color")
     .eq("id", rental.vehicle_id)
     .single();
 
@@ -306,14 +307,60 @@ app.post("/api/admin/rentals/:id/approve", async (c) => {
     .eq("id", rentalId);
 
   const renter = (rental as any).renters;
-  if (renter?.line_user_id) {
-    await pushLineMessage(
-      renter.line_user_id,
-      `✅ ยืนยันการชำระเงินเรียบร้อย\n\nรถ: ${vehicle?.plate_number}\nการจองของคุณได้รับการยืนยันแล้ว เจ้าของรถจะจัดส่งสัญญาเช่าให้ทาง LINE นี้เร็ว ๆ นี้`
+  const tenant = (rental as any).tenants;
+
+  // สร้างสัญญาเช่า PDF อัตโนมัติ + อัปโหลด + ส่งลิงก์เข้า LINE
+  let contractUrl: string | null = null;
+  try {
+    const days = Math.max(
+      1,
+      Math.ceil((new Date(rental.planned_end_at).getTime() - new Date(rental.start_at).getTime()) / 86400000)
     );
+    const pdfBytes = await generateContractPdf({
+      tenantName: tenant?.name || "-",
+      vehiclePlate: vehicle?.plate_number || "-",
+      vehicleBrand: vehicle?.brand || "",
+      vehicleModel: vehicle?.model || "",
+      vehicleColor: vehicle?.color || "",
+      renterName: renter?.full_name || "-",
+      renterPhone: renter?.phone || "-",
+      renterIdNumber: renter?.id_card_number || "-",
+      renterAddress: renter?.address || "-",
+      startDate: rental.start_at,
+      endDate: rental.planned_end_at,
+      priceTotal: Number(rental.price_total),
+      depositAmount: Number(vehicle?.deposit_amount ?? 0),
+      days,
+    });
+
+    const contractPath = `${rental.tenant_id}/contract-${rentalId}.pdf`;
+    await supabase.storage.from("contracts").upload(contractPath, Buffer.from(pdfBytes), {
+      contentType: "application/pdf",
+      upsert: true,
+    });
+
+    const { data: signedUrlData } = await supabase.storage
+      .from("contracts")
+      .createSignedUrl(contractPath, 60 * 60 * 24 * 30); // ลิงก์ใช้ได้ 30 วัน
+
+    contractUrl = signedUrlData?.signedUrl ?? null;
+
+    await supabase
+      .from("rentals")
+      .update({ contract_file_path: contractPath, contract_sent_at: new Date().toISOString() })
+      .eq("id", rentalId);
+  } catch (err) {
+    console.error("Contract generation failed:", err);
   }
 
-  return c.json({ ok: true });
+  if (renter?.line_user_id) {
+    const msg = contractUrl
+      ? `✅ ยืนยันการชำระเงินเรียบร้อย\n\nรถ: ${vehicle?.plate_number}\n\n📄 สัญญาเช่ารถของคุณ:\n${contractUrl}\n\n(ลิงก์ใช้ได้ 30 วัน)`
+      : `✅ ยืนยันการชำระเงินเรียบร้อย\n\nรถ: ${vehicle?.plate_number}\nการจองของคุณได้รับการยืนยันแล้ว`;
+    await pushLineMessage(renter.line_user_id, msg);
+  }
+
+  return c.json({ ok: true, contract_url: contractUrl });
 });
 
 app.post("/api/admin/rentals/:id/reject", async (c) => {
