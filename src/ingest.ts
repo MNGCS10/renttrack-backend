@@ -255,6 +255,113 @@ function generatePromptPayPayload(promptpayId: string, amount: number): string {
   return payload + crc16ccitt(payload);
 }
 
+// ---------------------------------------------------------------------
+// ADMIN ENDPOINTS — เจ้าของรถอนุมัติ/ปฏิเสธการจอง (ต้อง login ผ่าน dashboard)
+// ---------------------------------------------------------------------
+
+// เช็คว่าคนเรียก endpoint เป็นเจ้าของ tenant ของ rental นี้จริง (กัน endpoint นี้ถูกเรียกมั่ว ๆ)
+async function verifyTenantOwner(c: any, tenantId: string): Promise<boolean> {
+  const authHeader = c.req.header("Authorization") || "";
+  const token = authHeader.replace("Bearer ", "");
+  if (!token) return false;
+
+  const { data: userData, error } = await supabase.auth.getUser(token);
+  if (error || !userData?.user) return false;
+
+  const { data: membership } = await supabase
+    .from("tenant_users")
+    .select("tenant_id")
+    .eq("tenant_id", tenantId)
+    .eq("user_id", userData.user.id)
+    .maybeSingle();
+
+  return !!membership;
+}
+
+app.post("/api/admin/rentals/:id/approve", async (c) => {
+  const rentalId = c.req.param("id");
+
+  const { data: rental } = await supabase
+    .from("rentals")
+    .select("id, tenant_id, vehicle_id, renter_id, price_total, renters(line_user_id, full_name)")
+    .eq("id", rentalId)
+    .single();
+
+  if (!rental) return c.json({ error: "rental not found" }, 404);
+  if (!(await verifyTenantOwner(c, rental.tenant_id))) return c.json({ error: "unauthorized" }, 403);
+
+  const { data: vehicle } = await supabase
+    .from("vehicles")
+    .select("deposit_amount, plate_number")
+    .eq("id", rental.vehicle_id)
+    .single();
+
+  await supabase
+    .from("rentals")
+    .update({
+      status: "active",
+      admin_confirmed_at: new Date().toISOString(),
+      deposit_paid: vehicle?.deposit_amount ?? 0,
+    })
+    .eq("id", rentalId);
+
+  const renter = (rental as any).renters;
+  if (renter?.line_user_id) {
+    await pushLineMessage(
+      renter.line_user_id,
+      `✅ ยืนยันการชำระเงินเรียบร้อย\n\nรถ: ${vehicle?.plate_number}\nการจองของคุณได้รับการยืนยันแล้ว เจ้าของรถจะจัดส่งสัญญาเช่าให้ทาง LINE นี้เร็ว ๆ นี้`
+    );
+  }
+
+  return c.json({ ok: true });
+});
+
+app.post("/api/admin/rentals/:id/reject", async (c) => {
+  const rentalId = c.req.param("id");
+  const { reason } = await c.req.json().catch(() => ({ reason: null }));
+
+  const { data: rental } = await supabase
+    .from("rentals")
+    .select("id, tenant_id, vehicle_id, renters(line_user_id)")
+    .eq("id", rentalId)
+    .single();
+
+  if (!rental) return c.json({ error: "rental not found" }, 404);
+  if (!(await verifyTenantOwner(c, rental.tenant_id))) return c.json({ error: "unauthorized" }, 403);
+
+  await supabase
+    .from("rentals")
+    .update({ status: "cancelled", cancelled_reason: reason || null, cancelled_at: new Date().toISOString() })
+    .eq("id", rentalId);
+
+  // ปลดรถกลับเป็นว่าง ให้คนอื่นจองได้
+  await supabase.from("vehicles").update({ status: "available" }).eq("id", rental.vehicle_id);
+
+  const renter = (rental as any).renters;
+  if (renter?.line_user_id) {
+    await pushLineMessage(
+      renter.line_user_id,
+      `❌ การจองของคุณไม่สำเร็จ${reason ? `\n\nเหตุผล: ${reason}` : ""}\n\nติดต่อเจ้าของรถเพื่อสอบถามเพิ่มเติมได้เลย`
+    );
+  }
+
+  return c.json({ ok: true });
+});
+
+async function pushLineMessage(targetId: string, text: string) {
+  const token = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+  if (!token) return;
+  try {
+    await fetch("https://api.line.me/v2/bot/message/push", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ to: targetId, messages: [{ type: "text", text }] }),
+    });
+  } catch (err) {
+    console.error("LINE push (renter) failed:", err);
+  }
+}
+
 // ชั่วคราว — ดัก LINE userId ตอนทักแชท (เอาไปตั้ง LINE_ALERT_TARGET_ID)
 // ไปตั้ง Webhook URL นี้ใน LINE Developers Console แล้วส่งข้อความหา OA ดูใน Render log
 app.post("/line/webhook", async (c) => {
