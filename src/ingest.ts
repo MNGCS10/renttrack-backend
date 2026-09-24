@@ -47,6 +47,214 @@ interface PingPayload {
 
 app.get("/", (c) => c.text("RentTrack backend is running."));
 
+// ---------------------------------------------------------------------
+// PUBLIC ENDPOINTS — สำหรับหน้าร้าน LIFF (ลูกค้าทั่วไป ไม่ต้อง login)
+// ---------------------------------------------------------------------
+
+// 1. รายการรถว่างของ tenant นี้ — สำหรับหน้ารายการรถ
+app.get("/api/public/vehicles", async (c) => {
+  const tenantId = c.req.query("tenant_id");
+  if (!tenantId) return c.json({ error: "missing tenant_id" }, 400);
+
+  const { data, error } = await supabase
+    .from("vehicles")
+    .select("id, plate_number, brand, model, color, daily_rate, deposit_amount")
+    .eq("tenant_id", tenantId)
+    .eq("status", "available");
+
+  if (error) return c.json({ error: error.message }, 500);
+  return c.json({ vehicles: data });
+});
+
+// 2. คำนวณราคา — วันที่เริ่ม/สิ้นสุด × ราคาต่อวัน
+app.post("/api/public/quote", async (c) => {
+  const { vehicle_id, start_date, end_date } = await c.req.json();
+  if (!vehicle_id || !start_date || !end_date) {
+    return c.json({ error: "missing vehicle_id/start_date/end_date" }, 400);
+  }
+
+  const { data: vehicle, error } = await supabase
+    .from("vehicles")
+    .select("id, plate_number, brand, model, daily_rate, deposit_amount, status")
+    .eq("id", vehicle_id)
+    .single();
+
+  if (error || !vehicle) return c.json({ error: "vehicle not found" }, 404);
+  if (vehicle.status !== "available") return c.json({ error: "vehicle no longer available" }, 409);
+
+  const days = Math.max(1, Math.ceil((new Date(end_date).getTime() - new Date(start_date).getTime()) / 86400000));
+  const priceTotal = days * Number(vehicle.daily_rate);
+
+  return c.json({
+    vehicle,
+    days,
+    price_total: priceTotal,
+    deposit_amount: Number(vehicle.deposit_amount),
+    grand_total: priceTotal + Number(vehicle.deposit_amount),
+  });
+});
+
+// 3. อัปโหลดเอกสาร (บัตร ปชช./ใบขับขี่/สลิป) — เก็บใน private bucket เท่านั้น
+app.post("/api/public/upload-document", async (c) => {
+  const { tenant_id, file_base64, file_ext, doc_type } = await c.req.json();
+  if (!tenant_id || !file_base64 || !doc_type) {
+    return c.json({ error: "missing tenant_id/file_base64/doc_type" }, 400);
+  }
+
+  const allowedTypes = ["id_card", "driver_license", "payment_slip"];
+  if (!allowedTypes.includes(doc_type)) return c.json({ error: "invalid doc_type" }, 400);
+
+  const bytes = Buffer.from(file_base64, "base64");
+  const path = `${tenant_id}/${doc_type}-${crypto.randomUUID()}.${file_ext || "jpg"}`;
+
+  const { error } = await supabase.storage.from("renter-documents").upload(path, bytes, {
+    contentType: file_ext === "png" ? "image/png" : "image/jpeg",
+  });
+
+  if (error) return c.json({ error: error.message }, 500);
+  return c.json({ path });
+});
+
+// 4. สร้างลูกค้า + สัญญาเช่า (สถานะ pending รอ admin ยืนยันการชำระเงิน)
+app.post("/api/public/rentals", async (c) => {
+  const body = await c.req.json();
+  const {
+    tenant_id, vehicle_id, full_name, phone, email, address,
+    id_card_number, id_card_file_path, driver_license_file_path,
+    line_user_id, start_date, end_date,
+  } = body;
+
+  if (!tenant_id || !vehicle_id || !full_name || !phone || !start_date || !end_date) {
+    return c.json({ error: "missing required fields" }, 400);
+  }
+
+  // เช็คว่ารถยังว่างจริง ก่อนสร้างสัญญา (กัน race condition คนจองพร้อมกัน)
+  const { data: vehicle } = await supabase
+    .from("vehicles")
+    .select("id, daily_rate, deposit_amount, status")
+    .eq("id", vehicle_id)
+    .single();
+
+  if (!vehicle || vehicle.status !== "available") {
+    return c.json({ error: "vehicle no longer available" }, 409);
+  }
+
+  // สร้างโปรไฟล์ลูกค้า
+  const { data: renter, error: renterErr } = await supabase
+    .from("renters")
+    .insert({
+      tenant_id, full_name, phone, email: email || null, address: address || null,
+      id_card_number: id_card_number || null,
+      id_card_file_path: id_card_file_path || null,
+      driver_license_file_path: driver_license_file_path || null,
+      line_user_id: line_user_id || null,
+      consent_given_at: new Date().toISOString(),
+    })
+    .select()
+    .single();
+
+  if (renterErr) return c.json({ error: renterErr.message }, 500);
+
+  const days = Math.max(1, Math.ceil((new Date(end_date).getTime() - new Date(start_date).getTime()) / 86400000));
+  const priceTotal = days * Number(vehicle.daily_rate);
+
+  // สร้างสัญญาเช่า สถานะ pending (รอ admin ยืนยันสลิป)
+  const { data: rental, error: rentalErr } = await supabase
+    .from("rentals")
+    .insert({
+      tenant_id, vehicle_id, renter_id: renter.id,
+      renter_name: full_name, renter_phone: phone, renter_line_user_id: line_user_id || null,
+      start_at: start_date, planned_end_at: end_date,
+      price_total: priceTotal, deposit_paid: 0,
+      status: "pending",
+    })
+    .select()
+    .single();
+
+  if (rentalErr) return c.json({ error: rentalErr.message }, 500);
+
+  // เปลี่ยนสถานะรถเป็น "จองแล้ว" กันคนอื่นจองซ้ำระหว่างรอชำระเงิน
+  await supabase.from("vehicles").update({ status: "rented" }).eq("id", vehicle_id);
+
+  const tenant = await supabase.from("tenants").select("promptpay_id").eq("id", tenant_id).single();
+  const promptpayId = tenant.data?.promptpay_id;
+  const grandTotal = priceTotal + Number(vehicle.deposit_amount);
+
+  return c.json({
+    rental_id: rental.id,
+    renter_id: renter.id,
+    price_total: priceTotal,
+    deposit_amount: Number(vehicle.deposit_amount),
+    grand_total: grandTotal,
+    promptpay_payload: promptpayId ? generatePromptPayPayload(promptpayId, grandTotal) : null,
+  });
+});
+
+// 5. แนบสลิปโอนเงิน — เปลี่ยนสถานะรอ admin ยืนยัน (ยังไม่ auto-confirm)
+app.post("/api/public/rentals/:id/slip", async (c) => {
+  const rentalId = c.req.param("id");
+  const { slip_file_path } = await c.req.json();
+  if (!slip_file_path) return c.json({ error: "missing slip_file_path" }, 400);
+
+  const { error } = await supabase
+    .from("rentals")
+    .update({ payment_slip_path: slip_file_path })
+    .eq("id", rentalId);
+
+  if (error) return c.json({ error: error.message }, 500);
+  return c.json({ ok: true, message: "ส่งสลิปแล้ว รอเจ้าของรถยืนยัน" });
+});
+
+// ---------------------------------------------------------------------
+// PromptPay QR payload generator (EMVCo Merchant Presented Mode)
+// ---------------------------------------------------------------------
+function tlv(id: string, value: string): string {
+  return `${id}${value.length.toString().padStart(2, "0")}${value}`;
+}
+
+function crc16ccitt(str: string): string {
+  let crc = 0xffff;
+  for (let c = 0; c < str.length; c++) {
+    crc ^= str.charCodeAt(c) << 8;
+    for (let i = 0; i < 8; i++) {
+      crc = (crc & 0x8000) !== 0 ? (crc << 1) ^ 0x1021 : crc << 1;
+      crc &= 0xffff;
+    }
+  }
+  return crc.toString(16).toUpperCase().padStart(4, "0");
+}
+
+function generatePromptPayPayload(promptpayId: string, amount: number): string {
+  const clean = promptpayId.replace(/[^0-9]/g, "");
+  let targetTag: string, targetValue: string;
+
+  if (clean.length === 10) {
+    targetTag = "01"; // เบอร์โทร
+    targetValue = "0066" + clean.substring(1);
+  } else if (clean.length === 13) {
+    targetTag = "02"; // เลขบัตร ปชช./ผู้เสียภาษี
+    targetValue = clean;
+  } else {
+    targetTag = "03"; // e-Wallet ID
+    targetValue = clean;
+  }
+
+  const merchantInfo = tlv("00", "A000000677010111") + tlv(targetTag, targetValue);
+
+  let payload = "";
+  payload += tlv("00", "01");
+  payload += tlv("01", "12"); // dynamic QR (มีจำนวนเงินระบุ)
+  payload += tlv("29", merchantInfo);
+  payload += tlv("53", "764"); // THB
+  payload += tlv("54", amount.toFixed(2));
+  payload += tlv("58", "TH");
+  payload += tlv("59", "RENTTRACK");
+  payload += tlv("60", "BANGKOK");
+  payload += "6304";
+
+  return payload + crc16ccitt(payload);
+}
+
 // ชั่วคราว — ดัก LINE userId ตอนทักแชท (เอาไปตั้ง LINE_ALERT_TARGET_ID)
 // ไปตั้ง Webhook URL นี้ใน LINE Developers Console แล้วส่งข้อความหา OA ดูใน Render log
 app.post("/line/webhook", async (c) => {
