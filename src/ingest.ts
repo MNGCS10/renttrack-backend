@@ -64,7 +64,7 @@ app.get("/api/public/vehicles", async (c) => {
 
   const { data, error } = await supabase
     .from("vehicles")
-    .select("id, plate_number, brand, model, color, daily_rate, deposit_amount")
+    .select("id, plate_number, brand, model, color, daily_rate, deposit_amount, photo_url")
     .eq("tenant_id", tenantId)
     .eq("status", "available");
 
